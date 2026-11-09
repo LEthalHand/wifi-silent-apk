@@ -1,0 +1,470 @@
+name: One-Click APK Builder
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Android Project Files
+        run: |
+          mkdir -p app/src/main/java/com/example/wifisilent
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WifiAutoSilent"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application' version '8.7.2'
+              id 'org.jetbrains.kotlin.android' version '1.9.24'
+          }
+
+          android {
+              namespace 'com.example.wifisilent'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.example.wifisilent"
+                  minSdk 31
+                  targetSdk 35
+                  versionCode 2
+                  versionName "2.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.13.1'
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="WiFi Auto Silent"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".WifiMonitorService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/wifisilent/WifiMonitorService.kt
+          package com.example.wifisilent
+
+          import android.Manifest
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.media.AudioManager
+          import android.net.*
+          import android.net.wifi.WifiInfo
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import org.json.JSONObject
+
+          class WifiMonitorService : Service() {
+
+              private lateinit var connectivityManager: ConnectivityManager
+              private lateinit var audioManager: AudioManager
+              private lateinit var notificationManager: NotificationManager
+              private var lastAppliedSsid: String? = null
+
+              private val networkCallback = object : ConnectivityManager.NetworkCallback(
+                  ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO
+              ) {
+                  override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                      super.onCapabilitiesChanged(network, networkCapabilities)
+                      if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                          val wifiInfo = networkCapabilities.transportInfo as? WifiInfo
+                          val rawSsid = wifiInfo?.ssid?.removeSurrounding("\"") ?: ""
+                          evaluateWifiMatch(rawSsid)
+                      }
+                  }
+
+                  override fun onLost(network: Network) {
+                      super.onLost(network)
+                      lastAppliedSsid = null
+                      restoreNormalModeIfNeeded()
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                  audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+                  if (!hasLocationPermission()) {
+                      stopSelf()
+                      return
+                  }
+
+                  startMonitorForeground()
+                  registerWifiCallback()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  lastAppliedSsid = null
+                  val activeNet = connectivityManager.activeNetwork
+                  val caps = activeNet?.let { connectivityManager.getNetworkCapabilities(it) }
+                  val wifiInfo = caps?.transportInfo as? WifiInfo
+                  val currentSsid = wifiInfo?.ssid?.removeSurrounding("\"") ?: ""
+                  evaluateWifiMatch(currentSsid)
+                  return START_STICKY
+              }
+
+              private fun hasLocationPermission(): Boolean {
+                  return ContextCompat.checkSelfPermission(
+                      this, Manifest.permission.ACCESS_FINE_LOCATION
+                  ) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun startMonitorForeground() {
+                  val channelId = "wifi_silent_channel"
+                  val channel = NotificationChannel(
+                      channelId,
+                      "Wi-Fi Audio Automation",
+                      NotificationManager.IMPORTANCE_LOW
+                  )
+                  notificationManager.createNotificationChannel(channel)
+
+                  val pendingIntent = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("Wi-Fi Sound Guard Active")
+                      .setContentText("Monitoring saved Wi-Fi networks")
+                      .setSmallIcon(android.R.drawable.ic_lock_silent_mode)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
+
+                  startForeground(101, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+              }
+
+              private fun registerWifiCallback() {
+                  val request = NetworkRequest.Builder()
+                      .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                      .build()
+                  connectivityManager.registerNetworkCallback(request, networkCallback)
+              }
+
+              private fun evaluateWifiMatch(currentSsid: String) {
+                  if (currentSsid.isBlank() || currentSsid.contains("unknown ssid", ignoreCase = true)) return
+                  if (currentSsid.equals(lastAppliedSsid, ignoreCase = true)) return
+
+                  val prefs = getSharedPreferences("WifiSilentPrefs", Context.MODE_PRIVATE)
+                  val rulesJson = JSONObject(prefs.getString("wifi_rules", "{}") ?: "{}")
+
+                  var matchedMode: String? = null
+                  val keys = rulesJson.keys()
+                  while (keys.hasNext()) {
+                      val savedSsid = keys.next()
+                      if (savedSsid.equals(currentSsid, ignoreCase = true)) {
+                          matchedMode = rulesJson.getString(savedSsid)
+                          break
+                      }
+                  }
+
+                  if (matchedMode != null) {
+                      applyRingerMode(matchedMode)
+                      lastAppliedSsid = currentSsid
+                      prefs.edit().putBoolean("active_by_app", true).apply()
+                  } else if (lastAppliedSsid != null) {
+                      lastAppliedSsid = null
+                      restoreNormalModeIfNeeded()
+                  }
+              }
+
+              private fun applyRingerMode(mode: String) {
+                  if (!notificationManager.isNotificationPolicyAccessGranted) return
+
+                  when (mode) {
+                      "SILENT" -> audioManager.ringerMode = AudioManager.RINGER_MODE_SILENT
+                      "VIBRATE" -> audioManager.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+                  }
+              }
+
+              private fun restoreNormalModeIfNeeded() {
+                  val prefs = getSharedPreferences("WifiSilentPrefs", Context.MODE_PRIVATE)
+                  val restoreOnDisconnect = prefs.getBoolean("restore_normal", true)
+                  val activeByApp = prefs.getBoolean("active_by_app", false)
+
+                  if (restoreOnDisconnect && activeByApp && notificationManager.isNotificationPolicyAccessGranted) {
+                      audioManager.ringerMode = AudioManager.RINGER_MODE_NORMAL
+                      prefs.edit().putBoolean("active_by_app", false).apply()
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try {
+                      connectivityManager.unregisterNetworkCallback(networkCallback)
+                  } catch (_: Exception) {}
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/wifisilent/MainActivity.kt
+          package com.example.wifisilent
+
+          import android.Manifest
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.ConnectivityManager
+          import android.net.wifi.WifiInfo
+          import android.net.wifi.WifiManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import org.json.JSONObject
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var rulesDisplay: TextView
+              private lateinit var ssidInput: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val scrollView = ScrollView(this)
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 48, 48, 48)
+                  }
+                  scrollView.addView(layout)
+
+                  val btnPermissions = Button(this).apply {
+                      text = "Step 1: Grant Permissions (Tap until all 4 granted)"
+                  }
+
+                  ssidInput = EditText(this).apply {
+                      hint = "Enter Wi-Fi Name (SSID)"
+                  }
+
+                  val btnDetectWifi = Button(this).apply {
+                      text = "Fill Current Connected Wi-Fi Name"
+                  }
+
+                  val modeGroup = RadioGroup(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                  }
+                  val vibrateRadio = RadioButton(this).apply {
+                      text = "Vibrate Mode"
+                      id = View.generateViewId()
+                      isChecked = true
+                  }
+                  val silentRadio = RadioButton(this).apply {
+                      text = "Silent Mode"
+                      id = View.generateViewId()
+                  }
+                  modeGroup.addView(vibrateRadio)
+                  modeGroup.addView(silentRadio)
+
+                  val restoreCheck = CheckBox(this).apply {
+                      text = "Restore Normal Sound when disconnected"
+                      isChecked = true
+                  }
+
+                  val btnAddRule = Button(this).apply {
+                      text = "Step 2: Save Wi-Fi Rule & Start"
+                  }
+
+                  val btnClearRules = Button(this).apply {
+                      text = "Clear All Saved Wi-Fi Rules"
+                  }
+
+                  rulesDisplay = TextView(this).apply {
+                      setPadding(0, 32, 0, 32)
+                      textSize = 16f
+                  }
+
+                  layout.apply {
+                      addView(btnPermissions)
+                      addView(ssidInput)
+                      addView(btnDetectWifi)
+                      addView(modeGroup)
+                      addView(restoreCheck)
+                      addView(btnAddRule)
+                      addView(rulesDisplay)
+                      addView(btnClearRules)
+                  }
+                  setContentView(scrollView)
+
+                  val prefs = getSharedPreferences("WifiSilentPrefs", Context.MODE_PRIVATE)
+                  restoreCheck.isChecked = prefs.getBoolean("restore_normal", true)
+                  refreshRulesList()
+
+                  restoreCheck.setOnCheckedChangeListener { _, isChecked ->
+                      prefs.edit().putBoolean("restore_normal", isChecked).apply()
+                  }
+
+                  btnPermissions.setOnClickListener {
+                      requestAllMandatoryPermissions()
+                  }
+
+                  btnDetectWifi.setOnClickListener {
+                      val currentSsid = detectCurrentSsid()
+                      if (currentSsid.isNotEmpty()) {
+                          ssidInput.setText(currentSsid)
+                      } else {
+                          Toast.makeText(
+                              this,
+                              "Connect to Wi-Fi and grant Location permission first",
+                              Toast.LENGTH_LONG
+                          ).show()
+                      }
+                  }
+
+                  btnAddRule.setOnClickListener {
+                      if (!hasAllCorePermissions()) {
+                          Toast.makeText(this, "Please complete Step 1 permissions first", Toast.LENGTH_LONG).show()
+                          requestAllMandatoryPermissions()
+                          return@setOnClickListener
+                      }
+
+                      val ssid = ssidInput.text.toString().trim()
+                      if (ssid.isEmpty()) {
+                          Toast.makeText(this, "Enter a Wi-Fi SSID first", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
+
+                      val selectedMode = if (silentRadio.isChecked) "SILENT" else "VIBRATE"
+                      val rulesJson = JSONObject(prefs.getString("wifi_rules", "{}") ?: "{}")
+                      rulesJson.put(ssid, selectedMode)
+
+                      prefs.edit()
+                          .putString("wifi_rules", rulesJson.toString())
+                          .putBoolean("restore_normal", restoreCheck.isChecked)
+                          .apply()
+
+                      ssidInput.setText("")
+                      refreshRulesList()
+
+                      val serviceIntent = Intent(this, WifiMonitorService::class.java)
+                      ContextCompat.startForegroundService(this, serviceIntent)
+                      Toast.makeText(this, "Saved $ssid ($selectedMode) & Monitoring!", Toast.LENGTH_SHORT).show()
+                  }
+
+                  btnClearRules.setOnClickListener {
+                      prefs.edit().putString("wifi_rules", "{}").apply()
+                      stopService(Intent(this, WifiMonitorService::class.java))
+                      refreshRulesList()
+                      Toast.makeText(this, "All rules cleared and monitor stopped", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun detectCurrentSsid(): String {
+                  val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                  val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                  val wifiInfo = caps?.transportInfo as? WifiInfo
+                  val ssidFromCaps = wifiInfo?.ssid?.removeSurrounding("\"") ?: ""
+                  if (ssidFromCaps.isNotBlank() && !ssidFromCaps.contains("unknown ssid", ignoreCase = true)) {
+                      return ssidFromCaps
+                  }
+
+                  @Suppress("DEPRECATION")
+                  val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                  @Suppress("DEPRECATION")
+                  val fallbackSsid = wm.connectionInfo?.ssid?.removeSurrounding("\"") ?: ""
+                  return if (!fallbackSsid.contains("unknown ssid", ignoreCase = true)) fallbackSsid else ""
+              }
+
+              private fun refreshRulesList() {
+                  val prefs = getSharedPreferences("WifiSilentPrefs", Context.MODE_PRIVATE)
+                  val rulesJson = JSONObject(prefs.getString("wifi_rules", "{}") ?: "{}")
+                  val sb = StringBuilder("Active Wi-Fi Rules:\n")
+                  val keys = rulesJson.keys()
+                  if (!
